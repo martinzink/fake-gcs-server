@@ -7,18 +7,231 @@ package fakestorage
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"cloud.google.com/go/storage"
 	"github.com/fsouza/fake-gcs-server/internal/backend"
 	"github.com/fsouza/fake-gcs-server/internal/notification"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/api/iterator"
 )
+
+func TestMain(m *testing.M) {
+	emptyBucketDir, err := filepath.Abs(filepath.Join("..", "testdata", "basic", "empty-bucket"))
+	if err != nil {
+		panic(err)
+	}
+	err = ensureEmptyDir(emptyBucketDir)
+	if err != nil {
+		panic(err)
+	}
+	var status int
+	defer func() {
+		os.Remove(emptyBucketDir)
+		os.Exit(status)
+	}()
+	status = m.Run()
+}
+
+func TestGenerateObjectsFromFiles(t *testing.T) {
+	testContentType := "text/plain; charset=utf-8"
+
+	t.Parallel()
+	tests := []struct {
+		name                 string
+		folder               string
+		expectedObjects      []Object
+		expectedEmptyBuckets []string
+	}{
+		{
+			name:   "should load from sample folder",
+			folder: "../testdata/basic",
+			expectedObjects: []Object{
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "sample-bucket",
+						Name:        "some_file.txt",
+						ContentType: "text/plain; charset=utf-8",
+					},
+					Content: []byte("Some amazing content to be loaded"),
+				},
+			},
+			expectedEmptyBuckets: []string{"empty-bucket"},
+		},
+		{
+			name:   "should support multiple levels",
+			folder: "../testdata/multi-level",
+			expectedObjects: []Object{
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "some-bucket",
+						Name:        "a/b/c/d/e/f/object1.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("this is object 1\n"),
+				},
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "some-bucket",
+						Name:        "a/b/c/d/e/f/object2.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("this is object 2\n"),
+				},
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "some-bucket",
+						Name:        "root-object.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("r00t\n"),
+				},
+			},
+		},
+		{
+			name:   "should skip nonexistent folder",
+			folder: "../testdata/i-dont-exist",
+		},
+		{
+			name:   "should skip a regular file",
+			folder: "../testdata/basic/sample-bucket/some_file.txt",
+		},
+		{
+			name:   "should skip invalid directories and files",
+			folder: "../testdata/chaos",
+			expectedObjects: []Object{
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "bucket1",
+						Name:        "object1.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("object 1\n"),
+				},
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "bucket1",
+						Name:        "object2.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("object 2\n"),
+				},
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "bucket2",
+						Name:        "object1.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("object 1\n"),
+				},
+				{
+					ObjectAttrs: ObjectAttrs{
+						ACL: []storage.ACLRule{
+							{
+								Entity: "projectOwner-test-project",
+								Role:   "OWNER",
+							},
+						},
+						BucketName:  "bucket2",
+						Name:        "object2.txt",
+						ContentType: testContentType,
+					},
+					Content: []byte("object 2\n"),
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			objects, emptyBuckets := generateObjectsFromFiles(test.folder)
+			cmpOpts := []cmp.Option{
+				cmpopts.IgnoreFields(Object{}, "Crc32c", "Md5Hash"),
+				cmpopts.IgnoreUnexported(Object{}),
+			}
+			if diff := cmp.Diff(objects, test.expectedObjects, cmpOpts...); diff != "" {
+				t.Errorf("wrong list of objects returned\nwant %#v\ngot  %#v\ndiff: %s", test.expectedObjects, objects, diff)
+			}
+			if !cmp.Equal(emptyBuckets, test.expectedEmptyBuckets) {
+				t.Errorf("wrong list of empty buckets returned\nwant %#v\ngot  %#v", test.expectedEmptyBuckets, emptyBuckets)
+			}
+		})
+	}
+}
+
+func ensureEmptyDir(dirname string) error {
+	err := os.Mkdir(dirname, 0o755)
+	if err != nil {
+		dir, direrr := os.Open(dirname)
+		if direrr != nil {
+			return fmt.Errorf("cannot create empty dir %q: mkdir failed with %v. open failed with %v", dirname, err, direrr)
+		}
+		defer dir.Close()
+
+		_, direrr = dir.Readdirnames(1)
+		if direrr == io.EOF {
+			return nil
+		}
+		if direrr != nil {
+			return fmt.Errorf("cannot create empty dir %q: mkdir failed with %v. readdir failed with %v", dirname, err, direrr)
+		}
+		return fmt.Errorf("cannot create empty dir %q: it already exists and is not empty", dirname)
+	}
+	return nil
+}
 
 func TestNewServer(t *testing.T) {
 	t.Parallel()
@@ -80,15 +293,33 @@ func TestNewServerLogging(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	io.Copy(ioutil.Discard, res.Body)
+	io.Copy(io.Discard, res.Body)
 	if buf.Len() == 0 {
 		t.Error("Log was not written to buffer.")
 	}
 }
 
+// type ListenerStub struct {}
+
+// func TestNewServerGrpc(t *testing.T) {
+// 	t.Parallel()
+// 	l, err := net.Listen("tcp", ":2000")
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	server, err := NewServerWithOptions(Options{Listener: l})
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	if server.ts.Listener != l {
+// 		t.Error("Expected listener to be grpc")
+// 	}
+
+// }
+
 func TestPublicURL(t *testing.T) {
 	t.Parallel()
-	var tests = []struct {
+	tests := []struct {
 		name     string
 		options  Options
 		expected string
@@ -147,8 +378,116 @@ func TestDownloadObject(t *testing.T) {
 		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "files/txt/text-03.txt"}},
 		{ObjectAttrs: ObjectAttrs{BucketName: "other-bucket", Name: "static/css/website.css"}, Content: []byte("body {display: none;}")},
 	}
-	runServersTest(t, objs, testDownloadObject)
-	runServersTest(t, objs, testDownloadObjectRange)
+	runServersTest(t, runServersOptions{objs: objs}, testDownloadObject)
+	runServersTest(t, runServersOptions{objs: objs}, testDownloadObjectRange)
+}
+
+func TestDownloadAfterPublicHostChange(t *testing.T) {
+	server, err := NewServerWithOptions(Options{PublicHost: "127.0.0.1:80", InitialObjects: []Object{
+		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "files/txt/text-01.txt"}, Content: []byte("something")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := server.HTTPClient()
+	requestURL := server.URL() + "/some-bucket/files/txt/text-01.txt"
+
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// First request fails because the port configured in PublicHost
+	// doesn't match.
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("wrong status returned\nwant %d\ngot  %d", http.StatusNotFound, resp.StatusCode)
+	}
+
+	// Now set the public host to match the httptest.Server and try again.
+	serverURL, err := url.Parse(server.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.publicHost = serverURL.Host
+
+	req, err = http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// This second request should succeed because the public host now matches.
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("wrong status returned\nwant %d\ngot  %d", http.StatusOK, resp.StatusCode)
+	}
+}
+
+func TestDownloadPartialPublicHostMatch(t *testing.T) {
+	server, err := NewServerWithOptions(Options{PublicHost: "127.0.0.1", InitialObjects: []Object{
+		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "files/txt/text-01.txt"}, Content: []byte("something")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := server.HTTPClient()
+	requestURL := server.URL() + "/some-bucket/files/txt/text-01.txt"
+
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("wrong status returned\nwant %d\ngot  %d", http.StatusOK, resp.StatusCode)
+	}
+}
+
+func TestDownloadPartialHostValidationShouldNotValidatePortPartially(t *testing.T) {
+	server, err := NewServerWithOptions(Options{PublicHost: "127.0.0.1", InitialObjects: []Object{
+		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "files/txt/text-01.txt"}, Content: []byte("something")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := server.HTTPClient()
+	requestURL := server.URL() + "/some-bucket/files/txt/text-01.txt"
+
+	serverURL, err := url.Parse(server.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.publicHost = serverURL.Hostname() + ":" + serverURL.Port()[:2]
+
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("wrong status returned\nwant %d\ngot  %d", http.StatusNotFound, resp.StatusCode)
+	}
 }
 
 func testDownloadObject(t *testing.T, server *Server) {
@@ -179,6 +518,13 @@ func testDownloadObject(t *testing.T, server *Server) {
 			"://storage.googleapis.com/storage/v1/b/some-bucket/o/files/txt/text-01.txt?alt=media",
 			map[string]string{"accept-ranges": "bytes", "content-length": "9"},
 			"something",
+		},
+		{
+			"HEAD: using storage api",
+			http.MethodHead,
+			"://storage.googleapis.com/storage/v1/b/some-bucket/o/files/txt/text-01.txt",
+			map[string]string{"accept-ranges": "bytes", "content-length": "9"},
+			"",
 		},
 		{
 			"HEAD: bucket in the path",
@@ -218,7 +564,7 @@ func testDownloadObject(t *testing.T, server *Server) {
 					t.Errorf("wrong value for header %q:\nwant %q\ngot  %q", k, expectedV, v)
 				}
 			}
-			data, err := ioutil.ReadAll(resp.Body)
+			data, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -231,15 +577,16 @@ func testDownloadObject(t *testing.T, server *Server) {
 
 func testDownloadObjectRange(t *testing.T, server *Server) {
 	tests := []struct {
-		name           string
-		headers        map[string]string
-		expectedStatus int
-		expectedBody   string
+		name                 string
+		headers              map[string]string
+		expectedStatus       int
+		expectedContentRange string
+		expectedBody         string
 	}{
-		{"No range specified", map[string]string{}, http.StatusOK, "something"},
-		{"Partial range specified", map[string]string{"Range": "bytes=1-4"}, http.StatusPartialContent, "omet"},
-		{"Exact range specified", map[string]string{"Range": "bytes=0-8"}, http.StatusPartialContent, "something"},
-		{"Too-long range specified", map[string]string{"Range": "bytes=0-100"}, http.StatusPartialContent, "something"},
+		{"No range specified", map[string]string{}, http.StatusOK, "", "something"},
+		{"Partial range specified", map[string]string{"Range": "bytes=1-4"}, http.StatusPartialContent, "bytes 1-4/9", "omet"},
+		{"Exact range specified", map[string]string{"Range": "bytes=0-8"}, http.StatusPartialContent, "bytes 0-8/9", "something"},
+		{"Too-long range specified", map[string]string{"Range": "bytes=0-100"}, http.StatusPartialContent, "bytes 0-8/9", "something"},
 	}
 	for _, test := range tests {
 		test := test
@@ -260,7 +607,13 @@ func testDownloadObjectRange(t *testing.T, server *Server) {
 			if resp.StatusCode != test.expectedStatus {
 				t.Errorf("wrong status returned\nwant %d\ngot  %d", test.expectedStatus, resp.StatusCode)
 			}
-			data, err := ioutil.ReadAll(resp.Body)
+
+			contentRange := resp.Header.Get("Content-Range")
+			if contentRange != test.expectedContentRange {
+				t.Errorf("wrong Content-Range returned\nwant %s\ngot  %s", test.expectedContentRange, contentRange)
+			}
+
+			data, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -276,16 +629,25 @@ func TestUpdateServerConfig(t *testing.T) {
 		name                string
 		requestBody         string
 		expectedExternalUrl string
+		expectedPublicHost  string
 	}{
 		{
 			"PUT: empty json",
 			"{}",
 			"https://0.0.0.0:4443",
+			"0.0.0.0:4443",
 		},
 		{
 			"PUT: externalUrl provided",
 			"{\"externalUrl\": \"https://1.2.3.4:4321\"}",
 			"https://1.2.3.4:4321",
+			"0.0.0.0:4443",
+		},
+		{
+			"PUT: publicHost provided",
+			"{\"publicHost\": \"1.2.3.4:4321\"}",
+			"https://1.2.3.4:4321",
+			"1.2.3.4:4321",
 		},
 	}
 
@@ -317,7 +679,49 @@ func TestUpdateServerConfig(t *testing.T) {
 			}
 
 			assert.Equal(t, test.expectedExternalUrl, server.externalURL)
+			assert.Equal(t, test.expectedPublicHost, server.publicHost)
 		})
+	}
+}
+
+func TestInternalReseed(t *testing.T) {
+	opts := Options{
+		PublicHost:  "0.0.0.0:4443",
+		ExternalURL: "https://0.0.0.0:4443",
+		Seed:        "../testdata/basic",
+	}
+	server, err := NewServerWithOptions(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server.CreateBucket("sample-bucket")
+	server.CreateObject(Object{
+		ObjectAttrs: ObjectAttrs{
+			BucketName: "sample-bucket",
+			Name:       "something.txt",
+		},
+		Content: []byte("hello"),
+	})
+
+	client := server.HTTPClient()
+	req, err := http.NewRequest(http.MethodPost, "https://0.0.0.0:4443/_internal/reseed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("wrong status returned\nwant %d\ngot  %d", http.StatusOK, resp.StatusCode)
+	}
+
+	obj, err := server.GetObject("sample-bucket", "something.txt")
+	if err == nil {
+		t.Errorf("got unexpected <nil> error after reseeding. Object still exists? Object: %#v", obj)
 	}
 }
 
@@ -395,7 +799,7 @@ func TestDownloadObjectAlternatePublicHost(t *testing.T) {
 					t.Errorf("wrong value for header %q:\nwant %q\ngot  %q", k, expectedV, v)
 				}
 			}
-			data, err := ioutil.ReadAll(resp.Body)
+			data, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -652,7 +1056,7 @@ func TestServerEventNotification(t *testing.T) {
 			}
 			eventManager := &fakeEventManager{}
 			server.eventManager = eventManager
-			err = server.backend.CreateBucket(obj.BucketName, test.versioningEnabled)
+			err = server.backend.CreateBucket(obj.BucketName, backend.BucketAttrs{VersioningEnabled: test.versioningEnabled})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -691,7 +1095,7 @@ func TestServerBatchRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = server.backend.CreateBucket("some-bucket", true)
+	err = server.backend.CreateBucket("some-bucket", backend.BucketAttrs{VersioningEnabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +1165,6 @@ func TestServerBatchRequest(t *testing.T) {
 type fakeEventFields struct {
 	BucketName string
 	Name       string
-	Content    []byte
 	Metadata   map[string]string
 }
 
@@ -769,7 +1172,6 @@ func fakeEventFieldsFromObject(obj Object) fakeEventFields {
 	return fakeEventFields{
 		BucketName: obj.BucketName,
 		Name:       obj.Name,
-		Content:    obj.Content,
 		Metadata:   obj.Metadata,
 	}
 }
@@ -789,30 +1191,71 @@ type fakeEventManager struct {
 	events []fakeEvent
 }
 
-func (m *fakeEventManager) Trigger(o *backend.Object, eventType notification.EventType, extraEventAttr map[string]string) {
+func (m *fakeEventManager) Trigger(o *backend.StreamingObject, eventType notification.EventType, extraEventAttr map[string]string) {
+	streamingObject := fromBackendObjects([]backend.StreamingObject{*o})[0]
+	bufferedObject, err := streamingObject.BufferedObject()
+	if err != nil {
+		panic(err)
+	}
 	m.events = append(m.events, fakeEvent{
-		obj:       fakeEventFieldsFromObject(fromBackendObjects([]backend.Object{*o})[0]),
+		obj:       fakeEventFieldsFromObject(bufferedObject),
 		eventType: eventType,
 	})
 }
 
-func runServersTest(t *testing.T, objs []Object, fn func(*testing.T, *Server)) {
-	var testScenarios = []struct {
-		name    string
-		options Options
-	}{
+type runServersOptions struct {
+	objs            []Object
+	enableFSBackend bool
+}
+
+type serverTest struct {
+	name    string
+	options Options
+}
+
+func runServersTest(t *testing.T, runOpts runServersOptions, fn func(*testing.T, *Server)) {
+	testScenarios := []serverTest{
 		{
 			name:    "https listener",
-			options: Options{NoListener: false, InitialObjects: objs},
+			options: Options{NoListener: false, InitialObjects: runOpts.objs},
 		},
 		{
 			name:    "http listener",
-			options: Options{Scheme: "http", NoListener: false, InitialObjects: objs},
+			options: Options{Scheme: "http", NoListener: false, InitialObjects: runOpts.objs},
 		},
 		{
 			name:    "no listener",
-			options: Options{NoListener: true, InitialObjects: objs},
+			options: Options{NoListener: true, InitialObjects: runOpts.objs},
 		},
+	}
+	if runOpts.enableFSBackend {
+		dir, err := os.MkdirTemp("", "")
+		if err != nil {
+			t.Fatalf("cannot create temp dir for storage backend tests: %v", err)
+		}
+		t.Cleanup(func() {
+			os.RemoveAll(dir)
+		})
+		httpsDir := filepath.Join(dir, "https")
+		httpDir := filepath.Join(dir, "http")
+		err = os.MkdirAll(httpsDir, 0o755)
+		if err != nil {
+			t.Fatalf("cannot create temp dir for storage backend tests: %v", err)
+		}
+		err = os.MkdirAll(httpDir, 0o755)
+		if err != nil {
+			t.Fatalf("cannot create temp dir for storage backend tests: %v", err)
+		}
+		testScenarios = append(testScenarios,
+			serverTest{
+				name:    "https listener, fs backend",
+				options: Options{NoListener: false, InitialObjects: runOpts.objs, StorageRoot: httpsDir},
+			},
+			serverTest{
+				name:    "http listener, fs backend",
+				options: Options{Scheme: "http", NoListener: false, InitialObjects: runOpts.objs, StorageRoot: httpDir},
+			},
+		)
 	}
 	for _, test := range testScenarios {
 		test := test

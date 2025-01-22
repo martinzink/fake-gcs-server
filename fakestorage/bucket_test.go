@@ -6,13 +6,14 @@ package fakestorage
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
 	"os"
 	"runtime"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 )
 
@@ -24,6 +25,80 @@ func tempDir() string {
 	}
 }
 
+func TestServerClientUpdateBucketAttrs(t *testing.T) {
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
+		const bucketName = "best-bucket-ever"
+		server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName, DefaultEventBasedHold: false})
+		client := server.Client()
+		_, err := client.Bucket(bucketName).Update(context.TODO(), storage.BucketAttrsToUpdate{DefaultEventBasedHold: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		attrs, err := client.Bucket(bucketName).Attrs(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !attrs.DefaultEventBasedHold {
+			t.Errorf("expected default event based hold to be true, instead got: %v", attrs.DefaultEventBasedHold)
+		}
+	})
+	runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
+		const bucketName = "best-bucket-ever"
+		server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName, VersioningEnabled: false})
+		client := server.Client()
+		_, err := client.Bucket(bucketName).Update(context.TODO(), storage.BucketAttrsToUpdate{VersioningEnabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		attrs, err := client.Bucket(bucketName).Attrs(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !attrs.VersioningEnabled {
+			t.Errorf("expected VersioningEnabled hold to be true, instead got: %v", attrs.VersioningEnabled)
+		}
+	})
+}
+
+func TestServerClientStoreAndRetrieveBucketAttrs(t *testing.T) {
+	for _, defaultEventBasedHold := range []bool{true, false} {
+		defaultEventBasedHold := defaultEventBasedHold
+
+		runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
+			const bucketName = "best-bucket-ever"
+			server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName, DefaultEventBasedHold: defaultEventBasedHold})
+			client := server.Client()
+			attrs, err := client.Bucket(bucketName).Attrs(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if attrs.DefaultEventBasedHold != defaultEventBasedHold {
+				t.Errorf("expected default event based hold to be: %v", defaultEventBasedHold)
+			}
+		})
+	}
+}
+
+func TestServerClientBucketAlreadyExists(t *testing.T) {
+	objs := []Object{
+		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "img/hi-res/party-01.jpg"}},
+	}
+	runServersTest(t, runServersOptions{objs: objs}, func(t *testing.T, server *Server) {
+		client := server.Client()
+		err := client.Bucket("some-bucket").Create(context.Background(), "whatever", nil)
+		if err == nil {
+			t.Errorf("expected a 409 error")
+		}
+		apiErr := new(googleapi.Error)
+		if !errors.As(err, &apiErr) {
+			t.Errorf("expected a google API error, got %T", err)
+		}
+		if apiErr.Code != 409 {
+			t.Errorf("expected a google API error with code 409, got %v", apiErr.Code)
+		}
+	})
+}
+
 func TestServerClientBucketAttrs(t *testing.T) {
 	objs := []Object{
 		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "img/hi-res/party-01.jpg"}},
@@ -33,7 +108,7 @@ func TestServerClientBucketAttrs(t *testing.T) {
 		{ObjectAttrs: ObjectAttrs{BucketName: "dot.bucket", Name: "static/js/app.js"}},
 	}
 	startTime := time.Now()
-	runServersTest(t, objs, func(t *testing.T, server *Server) {
+	runServersTest(t, runServersOptions{objs: objs}, func(t *testing.T, server *Server) {
 		client := server.Client()
 		attrs, err := client.Bucket("some-bucket").Attrs(context.Background())
 		if err != nil {
@@ -49,13 +124,31 @@ func TestServerClientBucketAttrs(t *testing.T) {
 		if attrs.Created.Before(startTime.Truncate(time.Second)) || time.Now().Before(attrs.Created) {
 			t.Errorf("expecting bucket creation date between test start time %v and now %v, got %v", startTime, time.Now(), attrs.Created)
 		}
+		// TODO: Test `attrs.Updated` as soon as it is available in the [`storage.BucketAttrs`][1] type
+		//       (not available as of cloud.google.com/go/storage v1.31.0)
+		//       [1]: https://pkg.go.dev/cloud.google.com/go/storage#BucketAttrs
+		if attrs.StorageClass != "STANDARD" {
+			t.Errorf("wrong bucket storage class returned\nwant %q\ngot  %q", "STANDARD", attrs.StorageClass)
+		}
+		if attrs.ProjectNumber != 0 {
+			t.Errorf("wrong bucket project number returned\nwant %q\ngot  %q", "0", attrs.ProjectNumber)
+		}
+		if attrs.MetaGeneration != 1 {
+			t.Errorf("wrong bucket metageneration returned\nwant %q\ngot  %q", "1", attrs.MetaGeneration)
+		}
+		if attrs.Etag != "RVRhZw==" {
+			t.Errorf("wrong bucket etag returned\nwant %q\ngot  %q", "RVRhZw==", attrs.Etag)
+		}
+		if attrs.LocationType != "region" {
+			t.Errorf("wrong bucket location type returned\nwant %q\ngot  %q", "region", attrs.LocationType)
+		}
 	})
 }
 
 func TestServerClientBucketAttrsAfterCreateBucket(t *testing.T) {
 	for _, versioningEnabled := range []bool{true, false} {
 		versioningEnabled := versioningEnabled
-		runServersTest(t, nil, func(t *testing.T, server *Server) {
+		runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
 			const bucketName = "best-bucket-ever"
 			server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName, VersioningEnabled: versioningEnabled})
 			client := server.Client()
@@ -76,7 +169,7 @@ func TestServerClientBucketAttrsAfterCreateBucket(t *testing.T) {
 func TestServerClientDeleteBucket(t *testing.T) {
 	t.Run("it deletes empty buckets", func(t *testing.T) {
 		const bucketName = "bucket-to-delete"
-		runServersTest(t, nil, func(t *testing.T, server *Server) {
+		runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
 			server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
 			client := server.Client()
 			err := client.Bucket(bucketName).Delete(context.Background())
@@ -96,7 +189,7 @@ func TestServerClientDeleteBucket(t *testing.T) {
 	t.Run("it returns an error for non-empty buckets", func(t *testing.T) {
 		const bucketName = "non-empty-bucket"
 		objs := []Object{{ObjectAttrs: ObjectAttrs{BucketName: bucketName, Name: "static/js/app.js"}}}
-		runServersTest(t, objs, func(t *testing.T, server *Server) {
+		runServersTest(t, runServersOptions{objs: objs, enableFSBackend: true}, func(t *testing.T, server *Server) {
 			client := server.Client()
 			err := client.Bucket(bucketName).Delete(context.Background())
 			if err == nil {
@@ -107,7 +200,7 @@ func TestServerClientDeleteBucket(t *testing.T) {
 
 	t.Run("it returns an error for unknown buckets", func(t *testing.T) {
 		const bucketName = "non-existent-bucket"
-		runServersTest(t, nil, func(t *testing.T, server *Server) {
+		runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
 			client := server.Client()
 			err := client.Bucket(bucketName).Delete(context.Background())
 			if err == nil {
@@ -121,7 +214,7 @@ func TestServerClientBucketAttrsAfterCreateBucketByPost(t *testing.T) {
 	t.Parallel()
 	for _, versioningEnabled := range []bool{true, false} {
 		versioningEnabled := versioningEnabled
-		runServersTest(t, nil, func(t *testing.T, server *Server) {
+		runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
 			const bucketName = "post-bucket"
 			client := server.Client()
 			bucket := client.Bucket(bucketName)
@@ -159,11 +252,12 @@ func TestServerClientBucketCreateValidation(t *testing.T) {
 		"or spaces",
 		"don't even try",
 		"no/slashes/either",
+		"uppercaseNOTallowed",
 	}
 
 	for _, bucketName := range bucketNames {
 		bucketName := bucketName
-		runServersTest(t, nil, func(t *testing.T, server *Server) {
+		runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
 			client := server.Client()
 			err := client.Bucket(bucketName).Create(context.Background(), "whatever", nil)
 			if err == nil {
@@ -174,7 +268,7 @@ func TestServerClientBucketCreateValidation(t *testing.T) {
 }
 
 func TestServerClientBucketAttrsNotFound(t *testing.T) {
-	runServersTest(t, nil, func(t *testing.T, server *Server) {
+	runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
 		client := server.Client()
 		attrs, err := client.Bucket("some-bucket").Attrs(context.Background())
 		if err == nil {
@@ -195,7 +289,7 @@ func TestServerClientListBuckets(t *testing.T) {
 		{ObjectAttrs: ObjectAttrs{BucketName: "dot.bucket", Name: "static/js/app.js"}},
 	}
 
-	runServersTest(t, objs, func(t *testing.T, server *Server) {
+	runServersTest(t, runServersOptions{objs: objs}, func(t *testing.T, server *Server) {
 		client := server.Client()
 		const versionedBucketName = "post-bucket-with-versioning"
 		versionedBucketAttrs := storage.BucketAttrs{
@@ -237,7 +331,7 @@ func TestServerClientListObjects(t *testing.T) {
 		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "img/hi-res/party-02.jpg"}},
 		{ObjectAttrs: ObjectAttrs{BucketName: "some-bucket", Name: "img/hi-res/party-03.jpg"}},
 	}
-	dir, err := ioutil.TempDir(tempDir(), "fakestorage-test-root-")
+	dir, err := os.MkdirTemp(tempDir(), "fakestorage-test-root-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +348,7 @@ func TestServerClientListObjects(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			server, err := NewServerWithOptions(options)
 			if err != nil {
-				t.Error(err)
+				t.Fatal(err)
 			}
 			defer server.Stop()
 			client := server.Client()

@@ -7,12 +7,14 @@ package backend
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"reflect"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/fsouza/fake-gcs-server/internal/checksum"
 )
 
 func tempDir() string {
@@ -24,7 +26,7 @@ func tempDir() string {
 }
 
 func makeStorageBackends(t *testing.T) (map[string]Storage, func()) {
-	tempDir, err := ioutil.TempDir(tempDir(), "fakegcstest")
+	tempDir, err := os.MkdirTemp(tempDir(), "fakegcstest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,8 +34,12 @@ func makeStorageBackends(t *testing.T) (map[string]Storage, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	storageMemory, err := NewStorageMemory(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return map[string]Storage{
-			"memory":     NewStorageMemory(nil),
+			"memory":     storageMemory,
 			"filesystem": storageFS,
 		}, func() {
 			err := os.RemoveAll(tempDir)
@@ -64,51 +70,52 @@ func noError(t *testing.T, err error) {
 func shouldError(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {
-		t.Fatalf("should error, but error is nil")
+		t.Fatal("should error, but error is nil")
 	}
 }
 
 func uploadAndCompare(t *testing.T, storage Storage, obj Object) int64 {
 	isFSStorage := reflect.TypeOf(storage) == reflect.TypeOf(&storageFS{})
-	_, err := storage.CreateObject(obj)
+	newObject, err := storage.CreateObject(obj.StreamingObject(), NoConditions{})
 	if isFSStorage && obj.Generation != 0 {
 		t.Log("FS should not support objects generation")
 		shouldError(t, err)
 		obj.Generation = 0
-		_, err = storage.CreateObject(obj)
+		newObject, err = storage.CreateObject(obj.StreamingObject(), NoConditions{})
 	}
 	noError(t, err)
+	newObject.Close()
 	activeObj, err := storage.GetObject(obj.BucketName, obj.Name)
 	noError(t, err)
-	if isFSStorage && activeObj.Generation != 0 {
-		t.Errorf("FS should leave generation empty, as it does not persist it. Value: %d", activeObj.Generation)
-	}
-	if !isFSStorage && activeObj.Generation == 0 {
+	if activeObj.Generation == 0 {
 		t.Errorf("generation is empty, but we expect a unique int")
 	}
-	if err := compareObjects(activeObj, obj); err != nil {
+	if err := compareStreamingObjects(activeObj, obj.StreamingObject()); err != nil {
 		t.Errorf("object retrieved differs from the created one. Descr: %v", err)
 	}
+	activeObj.Close()
 	objFromGeneration, err := storage.GetObjectWithGeneration(obj.BucketName, obj.Name, activeObj.Generation)
-	if isFSStorage {
-		t.Log("FS should not implement fetch with generation")
-		shouldError(t, err)
-	} else {
-		noError(t, err)
-		if err := compareObjects(objFromGeneration, obj); err != nil {
-			t.Errorf("object retrieved differs from the created one. Descr: %v", err)
-		}
+	noError(t, err)
+	if err := compareStreamingObjects(objFromGeneration, obj.StreamingObject()); err != nil {
+		t.Errorf("object retrieved differs from the created one. Descr: %v", err)
 	}
+	objFromGeneration.Close()
 	return activeObj.Generation
 }
 
 func TestObjectCRUD(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("time resolution on Windows makes this test flaky on that platform")
+	}
+
 	const bucketName = "prod-bucket"
 	const objectName = "video/hi-res/best_video_1080p.mp4"
 	content1 := []byte("content1")
-	const crc1 = "crc1"
-	const md51 = "md51"
+	crc1 := checksum.EncodedCrc32cChecksum(content1)
+	md51 := checksum.EncodedMd5Hash(content1)
 	content2 := []byte("content2")
+	crc2 := checksum.EncodedCrc32cChecksum(content2)
+	md52 := checksum.EncodedMd5Hash(content2)
 	for _, versioningEnabled := range []bool{true, false} {
 		versioningEnabled := versioningEnabled
 		testForStorageBackends(t, func(t *testing.T, storage Storage) {
@@ -118,7 +125,7 @@ func TestObjectCRUD(t *testing.T) {
 			// Delete in non-existent case
 			err = storage.DeleteObject(bucketName, objectName)
 			shouldError(t, err)
-			err = storage.CreateBucket(bucketName, versioningEnabled)
+			err = storage.CreateBucket(bucketName, BucketAttrs{VersioningEnabled: versioningEnabled})
 			if reflect.TypeOf(storage) == reflect.TypeOf(&storageFS{}) && versioningEnabled {
 				t.Log("FS storage type should not implement versioning")
 				shouldError(t, err)
@@ -143,6 +150,8 @@ func TestObjectCRUD(t *testing.T) {
 					BucketName: bucketName,
 					Name:       objectName,
 					Generation: 1234,
+					Crc32c:     crc2,
+					Md5Hash:    md52,
 				},
 				Content: content2,
 			}
@@ -153,7 +162,7 @@ func TestObjectCRUD(t *testing.T) {
 				shouldError(t, err)
 			} else {
 				noError(t, err)
-				if err := compareObjects(initialObjectFromGeneration, initialObject); err != nil {
+				if err := compareStreamingObjects(initialObjectFromGeneration, initialObject.StreamingObject()); err != nil {
 					t.Errorf("get initial generation - object retrieved differs from the created one. Descr: %v", err)
 				}
 			}
@@ -190,7 +199,7 @@ func TestObjectCRUD(t *testing.T) {
 				return
 			}
 			noError(t, err)
-			if err := compareObjects(retrievedObject, secondVersionWithGeneration); err != nil {
+			if err := compareStreamingObjects(retrievedObject, secondVersionWithGeneration.StreamingObject()); err != nil {
 				t.Errorf("get object by generation after removal - object retrieved differs from the created one. Descr: %v", err)
 			}
 		})
@@ -202,7 +211,7 @@ func TestObjectQueryErrors(t *testing.T) {
 		versioningEnabled := versioningEnabled
 		testForStorageBackends(t, func(t *testing.T, storage Storage) {
 			const bucketName = "random-bucket"
-			err := storage.CreateBucket(bucketName, versioningEnabled)
+			err := storage.CreateBucket(bucketName, BucketAttrs{VersioningEnabled: versioningEnabled})
 			if reflect.TypeOf(storage) == reflect.TypeOf(&storageFS{}) && versioningEnabled {
 				t.Log("FS storage type should not implement versioning")
 				shouldError(t, err)
@@ -215,12 +224,73 @@ func TestObjectQueryErrors(t *testing.T) {
 				},
 				Content: []byte("random-content"),
 			}
-			_, err = storage.CreateObject(validObject)
+			obj, err := storage.CreateObject(validObject.StreamingObject(), NoConditions{})
 			noError(t, err)
+			obj.Close()
 			_, err = storage.GetObjectWithGeneration(validObject.BucketName, validObject.Name, 33333)
 			shouldError(t, err)
 		})
 	}
+}
+
+func TestBucketAttrsUpdateVersioning(t *testing.T) {
+	testForStorageBackends(t, func(t *testing.T, storage Storage) {
+		bucketName := "randombucket"
+		initBucketAttrs := BucketAttrs{VersioningEnabled: false}
+		updatedBucketAttrs := BucketAttrs{VersioningEnabled: true}
+		err := storage.CreateBucket(bucketName, initBucketAttrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = storage.UpdateBucket(bucketName, updatedBucketAttrs)
+		if reflect.TypeOf(storage) == reflect.TypeOf(&storageFS{}) {
+			if err == nil {
+				t.Fatal("fs storage should not accept updating buckets with versioning, but it's not failing")
+			}
+		} else {
+			if err != nil {
+				t.Fatal(err)
+			} else {
+				bucket, err := storage.GetBucket(bucketName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bucket.VersioningEnabled != updatedBucketAttrs.VersioningEnabled {
+					t.Errorf("Expected versioning enabled to be %v, instead got %v", updatedBucketAttrs.VersioningEnabled, bucket.VersioningEnabled)
+				}
+			}
+		}
+	})
+}
+
+func TestBucketAttrsStoreRetrieveUpdate(t *testing.T) {
+	testForStorageBackends(t, func(t *testing.T, storage Storage) {
+		bucketName := "randombucket"
+		initBucketAttrs := BucketAttrs{DefaultEventBasedHold: true, VersioningEnabled: false}
+		updatedBucketAttrs := BucketAttrs{DefaultEventBasedHold: false}
+		err := storage.CreateBucket(bucketName, initBucketAttrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bucket, err := storage.GetBucket(bucketName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bucket.DefaultEventBasedHold != initBucketAttrs.DefaultEventBasedHold {
+			t.Errorf("Expected bucket default event based hold to be true")
+		}
+		err = storage.UpdateBucket(bucketName, updatedBucketAttrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bucket, err = storage.GetBucket(bucketName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bucket.DefaultEventBasedHold != updatedBucketAttrs.DefaultEventBasedHold {
+			t.Errorf("Expected bucket default event based hold to be false")
+		}
+	})
 }
 
 func TestBucketCreateGetListDelete(t *testing.T) {
@@ -233,20 +303,17 @@ func TestBucketCreateGetListDelete(t *testing.T) {
 			t.Fatalf("more than zero buckets found: %d, and expecting zero when starting the test", len(buckets))
 		}
 		bucketsToTest := []Bucket{
-			{"prod-bucket", false, time.Time{}},
-			{"prod-bucket-with-versioning", true, time.Time{}},
+			{"prod-bucket", false, time.Time{}, false},
+			{"prod-bucket-with-versioning", true, time.Time{}, false},
 		}
 		for _, bucket := range bucketsToTest {
 			_, err := storage.GetBucket(bucket.Name)
 			if err == nil {
 				t.Fatalf("bucket %s, exists before being created", bucket.Name)
 			}
-			// The FS backend uses filesystem timestamps to store bucket creation time.
-			// Use a large +/- 5 second window to allow for an imperfectly synchronized
-			// clock generating the filesystem timestamp and to reduce test flakes.
-			timeBeforeCreation := time.Now().Add(-5 * time.Second)
-			err = storage.CreateBucket(bucket.Name, bucket.VersioningEnabled)
-			timeAfterCreation := time.Now().Add(5 * time.Second)
+			timeBeforeCreation := time.Now()
+			err = storage.CreateBucket(bucket.Name, BucketAttrs{VersioningEnabled: bucket.VersioningEnabled})
+			timeAfterCreation := time.Now()
 			if reflect.TypeOf(storage) == reflect.TypeOf(&storageFS{}) && bucket.VersioningEnabled {
 				if err == nil {
 					t.Fatal("fs storage should not accept creating buckets with versioning, but it's not failing")
@@ -261,7 +328,7 @@ func TestBucketCreateGetListDelete(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !isBucketEquivalentTo(bucketFromStorage, bucket, timeBeforeCreation, timeAfterCreation) {
-				t.Errorf("bucket %v does not have the expected props after retrieving. Expected %v and time between %v and %v",
+				t.Errorf("bucket %v does not have the expected props after retrieving. Expected %v and time roughly between %v and %v",
 					bucketFromStorage, bucket, timeBeforeCreation, timeAfterCreation)
 			}
 			buckets, err = storage.ListBuckets()
@@ -274,6 +341,9 @@ func TestBucketCreateGetListDelete(t *testing.T) {
 			if buckets[0].Name != bucket.Name {
 				t.Errorf("listed bucket has unexpected name. Expected %s, actual: %v", bucket.Name, buckets[0].Name)
 			}
+			if !isTimeRoughlyInRange(buckets[0].TimeCreated, timeBeforeCreation, timeAfterCreation) {
+				t.Errorf("listed bucket has unexpected creation time. Expected roughly between %v and %v, actual: %v", timeBeforeCreation, timeAfterCreation, buckets[0].TimeCreated)
+			}
 			err = storage.DeleteBucket(bucket.Name)
 			if err != nil {
 				t.Fatal(err)
@@ -282,28 +352,37 @@ func TestBucketCreateGetListDelete(t *testing.T) {
 	})
 }
 
-func isBucketEquivalentTo(a, b Bucket, earliest, latest time.Time) bool {
+func isBucketEquivalentTo(a, b Bucket, before, after time.Time) bool {
 	return a.Name == b.Name &&
 		a.VersioningEnabled == b.VersioningEnabled &&
-		a.TimeCreated.After(earliest) && a.TimeCreated.Before(latest)
+		isTimeRoughlyInRange(a.TimeCreated, before, after)
+}
+
+func isTimeRoughlyInRange(t, before, after time.Time) bool {
+	// The FS backend uses filesystem timestamps to store bucket creation time.
+	// Use a large +/- 5 second window to allow for an imperfectly synchronized
+	// clock generating the filesystem timestamp and to reduce test flakes.
+	earliest := before.Add(-5 * time.Second)
+	latest := after.Add(5 * time.Second)
+	return t.After(earliest) && t.Before(latest)
 }
 
 func TestBucketDuplication(t *testing.T) {
 	const bucketName = "prod-bucket"
 	testForStorageBackends(t, func(t *testing.T, storage Storage) {
-		err := storage.CreateBucket(bucketName, false)
+		err := storage.CreateBucket(bucketName, BucketAttrs{VersioningEnabled: false})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = storage.CreateBucket(bucketName, true)
+		err = storage.CreateBucket(bucketName, BucketAttrs{VersioningEnabled: true})
 		if err == nil {
 			t.Fatal("we were expecting a bucket duplication error")
 		}
 	})
 }
 
-func compareObjects(o1, o2 Object) error {
+func compareStreamingObjects(o1, o2 StreamingObject) error {
 	if o1.BucketName != o2.BucketName {
 		return fmt.Errorf("bucket name differs:\nmain %q\narg  %q", o1.BucketName, o2.BucketName)
 	}
@@ -322,8 +401,16 @@ func compareObjects(o1, o2 Object) error {
 	if o1.Generation != 0 && o2.Generation != 0 && o1.Generation != o2.Generation {
 		return fmt.Errorf("generations different from 0, but not equal:\nmain %q\narg  %q", o1.Generation, o2.Generation)
 	}
-	if !bytes.Equal(o1.Content, o2.Content) {
-		return fmt.Errorf("wrong object content:\nmain %q\narg  %q", o1.Content, o2.Content)
+	content1, err := io.ReadAll(o1.Content)
+	if err != nil {
+		return fmt.Errorf("count not read content from o1: %w", err)
+	}
+	content2, err := io.ReadAll(o2.Content)
+	if err != nil {
+		return fmt.Errorf("count not read content from o2: %w", err)
+	}
+	if !bytes.Equal(content1, content2) {
+		return fmt.Errorf("wrong object content:\nmain %q\narg  %q", content1, content2)
 	}
 	return nil
 }

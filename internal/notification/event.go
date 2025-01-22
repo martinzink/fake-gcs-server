@@ -44,6 +44,8 @@ type EventManagerOptions struct {
 	ProjectID string
 	// TopicName is the pubsub topic name to publish events on.
 	TopicName string
+	// Bucket is the name of the bucket to publish events from.
+	Bucket string
 	// ObjectPrefix, if not empty, only objects having this prefix will generate
 	// trigger events.
 	ObjectPrefix string
@@ -52,7 +54,7 @@ type EventManagerOptions struct {
 }
 
 type EventManager interface {
-	Trigger(o *backend.Object, eventType EventType, extraEventAttr map[string]string)
+	Trigger(o *backend.StreamingObject, eventType EventType, extraEventAttr map[string]string)
 }
 
 // PubsubEventManager checks if an event should be published.
@@ -65,6 +67,8 @@ type PubsubEventManager struct {
 	notifyOn EventNotificationOptions
 	// writer is where logs are written to.
 	writer io.Writer
+	// bucket, if not empty, only objects from this bucket will generate trigger events.
+	bucket string
 	// objectPrefix, if not empty, only objects having this prefix will generate
 	// trigger events.
 	objectPrefix string
@@ -76,6 +80,7 @@ func NewPubsubEventManager(options EventManagerOptions, w io.Writer) (*PubsubEve
 	manager := &PubsubEventManager{
 		writer:       w,
 		notifyOn:     options.NotifyOn,
+		bucket:       options.Bucket,
 		objectPrefix: options.ObjectPrefix,
 	}
 	if options.ProjectID != "" && options.TopicName != "" {
@@ -96,8 +101,11 @@ type eventPublisher interface {
 
 // Trigger checks if an event should be triggered. If so, it publishes the
 // event to a pubsub queue.
-func (m *PubsubEventManager) Trigger(o *backend.Object, eventType EventType, extraEventAttr map[string]string) {
+func (m *PubsubEventManager) Trigger(o *backend.StreamingObject, eventType EventType, extraEventAttr map[string]string) {
 	if m.publisher == nil {
+		return
+	}
+	if m.bucket != "" && o.BucketName != m.bucket {
 		return
 	}
 	if m.objectPrefix != "" && !strings.HasPrefix(o.Name, m.objectPrefix) {
@@ -139,7 +147,7 @@ func (m *PubsubEventManager) Trigger(o *backend.Object, eventType EventType, ext
 	}
 }
 
-func (m *PubsubEventManager) publish(o *backend.Object, eventType EventType, eventTime string, extraEventAttr map[string]string) error {
+func (m *PubsubEventManager) publish(o *backend.StreamingObject, eventType EventType, eventTime string, extraEventAttr map[string]string) error {
 	ctx := context.Background()
 	data, attributes, err := generateEvent(o, eventType, eventTime, extraEventAttr)
 	if err != nil {
@@ -155,27 +163,27 @@ func (m *PubsubEventManager) publish(o *backend.Object, eventType EventType, eve
 	return nil
 }
 
-// gcsEvent is the payload of a GCS event.  The description of the full object
-// can be found here:
+// gcsEvent is the payload of a GCS event. Note that all properties are string-quoted.
+// The description of the full object can be found here:
 // https://cloud.google.com/storage/docs/json_api/v1/objects#resource-representations.
 type gcsEvent struct {
 	Kind            string            `json:"kind"`
 	ID              string            `json:"id"`
 	Name            string            `json:"name"`
 	Bucket          string            `json:"bucket"`
-	Generation      int64             `json:"generation,omitempty"`
+	Generation      int64             `json:"generation,string,omitempty"`
 	ContentType     string            `json:"contentType"`
 	ContentEncoding string            `json:"contentEncoding,omitempty"`
 	Created         string            `json:"timeCreated,omitempty"`
 	Updated         string            `json:"updated,omitempty"`
 	StorageClass    string            `json:"storageClass"`
-	Size            string            `json:"size"`
+	Size            int64             `json:"size,string"`
 	MD5Hash         string            `json:"md5Hash,omitempty"`
 	CRC32c          string            `json:"crc32c,omitempty"`
 	MetaData        map[string]string `json:"metadata,omitempty"`
 }
 
-func generateEvent(o *backend.Object, eventType EventType, eventTime string, extraEventAttr map[string]string) ([]byte, map[string]string, error) {
+func generateEvent(o *backend.StreamingObject, eventType EventType, eventTime string, extraEventAttr map[string]string) ([]byte, map[string]string, error) {
 	payload := gcsEvent{
 		Kind:            "storage#object",
 		ID:              o.ID(),
@@ -187,7 +195,7 @@ func generateEvent(o *backend.Object, eventType EventType, eventTime string, ext
 		Created:         o.Created,
 		Updated:         o.Updated,
 		StorageClass:    "STANDARD",
-		Size:            strconv.Itoa(len(o.Content)),
+		Size:            o.Size,
 		MD5Hash:         o.Md5Hash,
 		CRC32c:          o.Crc32c,
 		MetaData:        o.Metadata,
